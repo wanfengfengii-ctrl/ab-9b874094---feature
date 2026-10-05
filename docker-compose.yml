@@ -1,0 +1,47 @@
+# 海洋观测平台：API 服务 + 一次性 verify 服务。
+# 宿主机端口通过环境变量 HOST_PORT 配置（默认 8080）：
+#   HOST_PORT=18080 docker compose up -d
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    image: ocean-observation-api:latest
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      DB_PATH: /data/observations.db
+      # 固定密钥：游标在服务重启后仍可继续；生产部署请通过环境覆盖。
+      CURSOR_SECRET: ${CURSOR_SECRET:-dev-fixed-cursor-secret-change-me}
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - obs-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+    restart: unless-stopped
+
+  # 一次性服务：清洁启动后等 API 健康 -> 代码测试 -> 插入数据并在分页中途追加早时刻数据 -> 冒烟。
+  # 以退出码汇报：0 全部通过，非零存在失败。`docker compose up` 随其退出而结束。
+  verify:
+    build:
+      context: .
+      target: verify
+    image: ocean-observation-verify:latest
+    environment:
+      BASE_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  obs-data:
