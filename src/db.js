@@ -40,6 +40,18 @@ export class Store {
     this.db.exec(`
       INSERT OR IGNORE INTO seq_meta (id, last_seq) VALUES (1, 0)
     `);
+    // 并行导出会话：令牌中的不透明 id 指向此处，持久化保证重启后各分片仍能读完同一快照。
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS exports (
+        token_id     TEXT PRIMARY KEY,
+        stream_id    TEXT    NOT NULL,
+        snapshot_seq INTEGER NOT NULL,
+        from_ts      TEXT    NOT NULL,
+        to_ts        TEXT    NOT NULL,
+        worker_count INTEGER NOT NULL,
+        created_at   TEXT    NOT NULL
+      ) WITHOUT ROWID
+    `);
     this.#prepareStatements();
   }
 
@@ -78,6 +90,43 @@ export class Store {
           WHERE stream_id = ? AND seq <= ? AND ts >= ? AND ts <= ?`
       ),
       totalSamples: db.prepare('SELECT COUNT(*) AS n FROM samples'),
+      insertExport: db.prepare(
+        `INSERT INTO exports
+           (token_id, stream_id, snapshot_seq, from_ts, to_ts, worker_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ),
+      getExport: db.prepare(
+        `SELECT token_id AS tokenId, stream_id AS streamId,
+                snapshot_seq AS snapshotSeq, from_ts AS fromTs, to_ts AS toTs,
+                worker_count AS workerCount, created_at AS createdAt
+           FROM exports WHERE token_id = ?`
+      ),
+      // 分片页：先按与普通分页完全一致的稳定次序计算零基序号 rnk，
+      // 再以 rnk % workerCount = workerIndex 选取本分片；keyset 的 after
+      // 必定指向同分片元素（游标由服务端签发），故各分片不重不漏。
+      shardPageStart: db.prepare(
+        `SELECT ts, sampleId, value, seq FROM (
+            SELECT ts, sample_id AS sampleId, value, seq,
+                   (ROW_NUMBER() OVER (ORDER BY ts ASC, sample_id ASC) - 1) AS rnk
+              FROM samples
+             WHERE stream_id = ? AND seq <= ? AND ts >= ? AND ts <= ?
+          )
+          WHERE rnk % ? = ?
+          ORDER BY ts ASC, sampleId ASC
+          LIMIT ?`
+      ),
+      shardPageAfter: db.prepare(
+        `SELECT ts, sampleId, value, seq FROM (
+            SELECT ts, sample_id AS sampleId, value, seq,
+                   (ROW_NUMBER() OVER (ORDER BY ts ASC, sample_id ASC) - 1) AS rnk
+              FROM samples
+             WHERE stream_id = ? AND seq <= ? AND ts >= ? AND ts <= ?
+          )
+          WHERE rnk % ? = ?
+            AND (ts > ? OR (ts = ? AND sampleId > ?))
+          ORDER BY ts ASC, sampleId ASC
+          LIMIT ?`
+      ),
     };
   }
 
@@ -166,6 +215,59 @@ export class Store {
     return Number(
       this.stmts.countSnapshot.get(streamId, snapshotSeq, range.fromTs, range.toTs).n
     );
+  }
+
+  /** 持久化一次并行导出会话（其快照上界与会话参数随令牌长期有效）。 */
+  createExport(rec) {
+    this.stmts.insertExport.run(
+      rec.tokenId, rec.streamId, rec.snapshotSeq, rec.fromTs, rec.toTs,
+      rec.workerCount, rec.createdAt
+    );
+  }
+
+  getExport(tokenId) {
+    const row = this.stmts.getExport.get(tokenId);
+    if (!row) return null;
+    return {
+      tokenId: row.tokenId,
+      streamId: row.streamId,
+      snapshotSeq: Number(row.snapshotSeq),
+      fromTs: row.fromTs,
+      toTs: row.toTs,
+      workerCount: Number(row.workerCount),
+      createdAt: row.createdAt,
+    };
+  }
+
+  /**
+   * 读取某导出会话的一个分片页。
+   * 分片规则：快照内按 (ts, sampleId) 从 0 编号，第 workerIndex 分片取
+   * rnk % workerCount === workerIndex 的元素；各分片互不重叠，合并后
+   * 恰好覆盖快照内全部元素。after 为该分片上一页末元素（keyset）。
+   */
+  readShardPage(
+    { streamId, snapshotSeq, fromTs, toTs, workerCount, workerIndex },
+    after, pageSize
+  ) {
+    let rows;
+    if (after) {
+      rows = this.stmts.shardPageAfter.all(
+        streamId, snapshotSeq, fromTs, toTs,
+        workerCount, workerIndex,
+        after.ts, after.ts, after.sampleId, pageSize
+      );
+    } else {
+      rows = this.stmts.shardPageStart.all(
+        streamId, snapshotSeq, fromTs, toTs,
+        workerCount, workerIndex, pageSize
+      );
+    }
+    return rows.map((r) => ({
+      ts: r.ts,
+      sampleId: r.sampleId,
+      value: Number(r.value),
+      seq: Number(r.seq),
+    }));
   }
 
   totalSamples() {

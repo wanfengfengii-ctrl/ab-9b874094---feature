@@ -5,16 +5,19 @@ import {
   issueCursor,
   parseCursor,
   bindCursor,
+  bindExportToken,
+  bindShardCursor,
   CursorError,
 } from './cursor.js';
 import {
   validateBatch,
   validateQuery,
+  validateExportCreate,
   ValidationError,
-  TIME_BOUNDS,
 } from './validation.js';
 
 const STREAM_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
+const DEFAULT_EXPORT_WORKERS = 4;
 
 export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex') } = {}) {
   const store = new Store(dbPath ?? process.env.DB_PATH ?? '/data/observations.db');
@@ -34,7 +37,7 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
     });
   }
 
-  async function readJson(req) {
+  async function readJson(req, { allowEmpty = false } = {}) {
     const chunks = [];
     let size = 0;
     for await (const chunk of req) {
@@ -45,6 +48,7 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
       chunks.push(chunk);
     }
     if (chunks.length === 0) {
+      if (allowEmpty) return {};
       throw new ValidationError('缺少 JSON 请求体');
     }
     try {
@@ -56,8 +60,12 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
 
   /**
    * GET /api/streams/:streamId/samples
-   * 首次请求（无 cursor）：固定当前接收序号为快照上界。
-   * 后续请求（带 cursor）：沿用发起时的快照序号与时间范围，游标重启后仍可用。
+   *
+   * 两种模式：
+   *  - 普通快照（无 exportToken）：首次请求固定当前接收序号为快照上界；
+   *    后续请求（带 cursor）沿用发起时的快照序号与时间范围，重启后仍可用。
+   *  - 并行导出分片（带 exportToken + workerIndex）：沿导出创建时固定的同一份
+   *    快照翻本分片页；游标绑定导出令牌与分片编号，串用即明确报错。
    */
   function handleList(req, res, streamId, url) {
     let q;
@@ -70,8 +78,11 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
       throw err;
     }
 
+    if (q.exportToken !== null) {
+      return handleShardList(res, streamId, q, url);
+    }
+
     let snapshotSeq, fromTs, toTs, pageSize, after;
-    let sessionStarted = false;
 
     if (q.cursor) {
       let payload;
@@ -103,13 +114,127 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
       toTs = q.toTs;
       pageSize = q.pageSize;
       after = null;
-      sessionStarted = true;
     }
 
+    return sendSnapshotPage(res, {
+      kind: 'snapshot',
+      streamId, snapshotSeq, fromTs, toTs, pageSize, after,
+    });
+  }
+
+  /** 并行导出：读取 exportToken 指定会话的第 workerIndex 个分片页。 */
+  function handleShardList(res, streamId, q, url) {
+    let payload;
+    try {
+      payload = parseCursor(cursorSecret, q.exportToken);
+    } catch (err) {
+      if (err instanceof CursorError) {
+        // 令牌与游标同一线格式，但语义是导出令牌：归一到导出令牌错误码
+        const code =
+          err.code === 'cursor_signature_invalid' ? 'export_token_invalid'
+          : err.code === 'invalid_cursor' ? 'invalid_export_token'
+          : err.code;
+        return sendError(res, err.statusCode, code, err.message);
+      }
+      throw err;
+    }
+
+    let exportRec;
+    try {
+      exportRec = bindExportToken(payload, { streamId }, (id) => store.getExport(id));
+    } catch (err) {
+      if (err instanceof CursorError) {
+        return sendError(res, err.statusCode, err.code, err.message);
+      }
+      throw err;
+    }
+
+    const tokenId = payload.d;
+
+    // 时间范围在创建导出时即固定：携带令牌又显式给出不同 from/to -> 明确报错。
+    if (url.searchParams.has('from') && q.fromTs !== exportRec.fromTs) {
+      return sendError(res, 400, 'export_range_mismatch',
+        `时间范围起点与导出创建时不一致（创建时为 ${exportRec.fromTs}）`);
+    }
+    if (url.searchParams.has('to') && q.toTs !== exportRec.toTs) {
+      return sendError(res, 400, 'export_range_mismatch',
+        `时间范围终点与导出创建时不一致（创建时为 ${exportRec.toTs}）`);
+    }
+
+    if (q.workerIndex >= exportRec.workerCount) {
+      return sendError(
+        res, 400, 'worker_index_out_of_range',
+        `workerIndex=${q.workerIndex} 越界：该导出共有 ${exportRec.workerCount} 个工作进程（编号 0..${exportRec.workerCount - 1}）`,
+        { workerIndex: q.workerIndex, workerCount: exportRec.workerCount }
+      );
+    }
+
+    const workerIndex = q.workerIndex;
+    let snapshotSeq, fromTs, toTs, pageSize, after;
+    if (q.cursor) {
+      let cursorPayload;
+      try {
+        cursorPayload = parseCursor(cursorSecret, q.cursor);
+      } catch (err) {
+        if (err instanceof CursorError) {
+          return sendError(res, err.statusCode, err.code, err.message);
+        }
+        throw err;
+      }
+      try {
+        ({ snapshotSeq, fromTs, toTs, pageSize, after } = bindShardCursor(
+          cursorPayload,
+          {
+            exportRec,
+            tokenId,
+            streamId,
+            workerIndex,
+            pageSize: url.searchParams.has('pageSize') ? q.pageSize : null,
+          }
+        ));
+      } catch (err) {
+        if (err instanceof CursorError) {
+          return sendError(res, err.statusCode, err.code, err.message);
+        }
+        throw err;
+      }
+    } else {
+      ({ snapshotSeq, fromTs, toTs } = exportRec);
+      pageSize = q.pageSize;
+      after = null;
+    }
+
+    return sendSnapshotPage(res, {
+      kind: 'shard',
+      streamId, snapshotSeq, fromTs, toTs, pageSize, after,
+      workerCount: exportRec.workerCount,
+      workerIndex,
+      tokenId,
+    });
+  }
+
+  /**
+   * 读取一页并输出。kind='snapshot' 走普通快照；kind='shard' 走导出分片。
+   * 下一页游标（如有）绑定对应会话，分片游标额外绑定 tokenId 与 workerIndex。
+   */
+  function sendSnapshotPage(res, ctx) {
+    const { streamId, snapshotSeq, fromTs, toTs, pageSize, after } = ctx;
     const limit = pageSize + 1; // 多取一条以判断是否还有下一页
-    const rows = store.readPage(
-      streamId, snapshotSeq, { fromTs, toTs }, after, limit
-    );
+    const rows =
+      ctx.kind === 'shard'
+        ? store.readShardPage(
+            {
+              streamId,
+              snapshotSeq,
+              fromTs,
+              toTs,
+              workerCount: ctx.workerCount,
+              workerIndex: ctx.workerIndex,
+            },
+            after,
+            limit
+          )
+        : store.readPage(streamId, snapshotSeq, { fromTs, toTs }, after, limit);
     const hasMore = rows.length > pageSize;
     const page = hasMore ? rows.slice(0, pageSize) : rows;
 
@@ -122,7 +247,7 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
     let nextCursor = null;
     if (hasMore && page.length > 0) {
       const last = page[page.length - 1];
-      nextCursor = issueCursor(cursorSecret, {
+      const cursorPayload = {
         v: 1,
         s: streamId,
         q: snapshotSeq,
@@ -130,15 +255,62 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
         t: toTs,
         p: pageSize,
         a: { ts: last.ts, i: last.sampleId },
-      });
+      };
+      if (ctx.kind === 'shard') {
+        cursorPayload.e = ctx.tokenId;
+        cursorPayload.w = ctx.workerIndex;
+      }
+      nextCursor = issueCursor(cursorSecret, cursorPayload);
     }
 
     return send(res, 200, {
       items,
       pageSize,
       snapshotSeq,
+      ...(ctx.kind === 'shard'
+        ? {
+            exportToken: issueCursor(cursorSecret, { v: 2, d: ctx.tokenId }),
+            workerIndex: ctx.workerIndex,
+            workerCount: ctx.workerCount,
+          }
+        : {}),
       nextCursor,
       done: nextCursor === null,
+    });
+  }
+
+  /**
+   * POST /api/streams/:streamId/exports
+   * 创建并行导出：固定当前接收序号为快照上界（创建后到达的数据一律不进入），
+   * 返回不透明 exportToken、snapshotSeq 与实际工作进程数。
+   */
+  async function handleCreateExport(req, res, streamId) {
+    const body = await readJson(req, { allowEmpty: true });
+    let params;
+    try {
+      params = validateExportCreate(body);
+    } catch (err) {
+      if (err instanceof ValidationError) {
+        return sendError(res, 400, 'invalid_request', err.message, err.details);
+      }
+      throw err;
+    }
+    const workerCount = params.workerCount ?? DEFAULT_EXPORT_WORKERS;
+    const snapshotSeq = store.currentSeq();
+    const tokenId = randomBytes(18).toString('base64url'); // 不随响应暴露原文
+    store.createExport({
+      tokenId,
+      streamId,
+      snapshotSeq,
+      fromTs: params.fromTs,
+      toTs: params.toTs,
+      workerCount,
+      createdAt: new Date().toISOString(),
+    });
+    return send(res, 201, {
+      exportToken: issueCursor(cursorSecret, { v: 2, d: tokenId }),
+      snapshotSeq,
+      workerCount,
     });
   }
 
@@ -172,7 +344,9 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
         });
       }
 
-      const m = url.pathname.match(/^\/api\/streams\/([^/]+)\/samples\/?$/);
+      const samplesMatch = url.pathname.match(/^\/api\/streams\/([^/]+)\/samples\/?$/);
+      const exportsMatch = url.pathname.match(/^\/api\/streams\/([^/]+)\/exports\/?$/);
+      const m = samplesMatch ?? exportsMatch;
       if (!m) {
         return sendError(res, 404, 'not_found', `路径不存在: ${url.pathname}`);
       }
@@ -186,9 +360,15 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
         return sendError(res, 400, 'invalid_stream_id', 'streamId 非法');
       }
 
+      if (exportsMatch) {
+        if (req.method !== 'POST') {
+          return sendError(res, 405, 'method_not_allowed', '该端点仅支持 POST');
+        }
+        return await handleCreateExport(req, res, streamId);
+      }
       if (req.method === 'POST') return await handlePost(req, res, streamId);
       if (req.method === 'GET') return handleList(req, res, streamId, url);
-      return sendError(res, 405, 'method_not_allowed', '仅支持 GET / POST', );
+      return sendError(res, 405, 'method_not_allowed', '仅支持 GET / POST');
     } catch (err) {
       if (err instanceof ValidationError) {
         return sendError(res, 400, 'invalid_request', err.message, err.details);

@@ -29,7 +29,8 @@ services:
       start_period: 2s
     restart: unless-stopped
 
-  # 一次性服务：清洁启动后等 API 健康 -> 代码测试 -> 插入数据并在分页中途追加早时刻数据 -> 冒烟。
+  # 一次性服务：清洁启动后等 API 健康 -> 代码测试 -> 冒烟
+  # （分页中途追加早时刻数据 + 多工作进程并行导出/错误矩阵/重启后续分片）。
   # 以退出码汇报：0 全部通过，非零存在失败。`docker compose up` 随其退出而结束。
   verify:
     build:

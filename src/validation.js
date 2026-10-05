@@ -121,6 +121,62 @@ export function validateQuery(searchParams) {
   }
   out.pageSize = pageSize;
   out.cursor = searchParams.get('cursor');
+
+  // 并行导出参数（未携带 exportToken 时全部忽略，保持旧接入与快照分页兼容）
+  out.exportToken = searchParams.get('exportToken');
+  out.workerIndex = null;
+  if (out.exportToken !== null) {
+    const wi = searchParams.get('workerIndex');
+    if (wi === null) {
+      throw new ValidationError('携带 exportToken 时必须提供零基 workerIndex');
+    }
+    if (!/^\d+$/.test(wi)) {
+      throw new ValidationError('workerIndex 必须为非负整数');
+    }
+    out.workerIndex = Number(wi);
+    if (out.workerIndex > 7) {
+      throw new ValidationError('workerIndex 超出允许范围（0..7）');
+    }
+  }
+  return out;
+}
+
+export const EXPORT_WORKER_BOUNDS = { MIN: 2, MAX: 8 };
+
+/**
+ * 校验 POST .../exports 请求体。全部字段可选：
+ *   { from?, to?, workerCount? }
+ * @returns {{fromTs:string, toTs:string, workerCount:number}}
+ */
+export function validateExportCreate(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ValidationError('请求体必须为对象');
+  }
+  const out = { fromTs: MIN_TS, toTs: MAX_TS, workerCount: null };
+
+  if (body.from !== undefined && body.from !== null) {
+    out.fromTs = parseRfc3339(body.from).canonical;
+  }
+  if (body.to !== undefined && body.to !== null) {
+    out.toTs = parseRfc3339(body.to).canonical;
+  }
+  if (out.fromTs > out.toTs) {
+    throw new ValidationError('时间范围非法：from 晚于 to');
+  }
+
+  if (body.workerCount !== undefined && body.workerCount !== null) {
+    const wc = body.workerCount;
+    if (typeof wc !== 'number' || !Number.isInteger(wc)) {
+      throw new ValidationError('workerCount 必须为 2..8 的整数');
+    }
+    if (wc < EXPORT_WORKER_BOUNDS.MIN || wc > EXPORT_WORKER_BOUNDS.MAX) {
+      throw new ValidationError(
+        `workerCount 允许范围为 ${EXPORT_WORKER_BOUNDS.MIN}..${EXPORT_WORKER_BOUNDS.MAX}`,
+        { received: wc }
+      );
+    }
+    out.workerCount = wc;
+  }
   return out;
 }
 
