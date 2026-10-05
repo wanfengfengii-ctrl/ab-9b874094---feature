@@ -35,6 +35,38 @@ const postSamples = (stream, samples) =>
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ samples }),
   });
+const createExport = (stream, body = {}) =>
+  api(`/api/streams/${stream}/exports`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+/** 并发排空某导出的全部分片，返回按 worker 收集的 sampleId 数组。 */
+async function drainExport(stream, token, workerCount, { pageSize = 7 } = {}) {
+  async function drainOne(w) {
+    const ids = [];
+    let cursor = null;
+    let guard = 0;
+    do {
+      const u = `/api/streams/${stream}/samples?exportToken=${encodeURIComponent(token)}` +
+        `&workerIndex=${w}&pageSize=${pageSize}` +
+        (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+      const r = await api(u);
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(`worker ${w} -> ${r.status} ${j.error?.code ?? ''}`);
+      }
+      const page = await r.json();
+      for (const it of page.items) ids.push(it.sampleId);
+      cursor = page.nextCursor;
+      if (++guard > 100) throw new Error('分页守卫触发');
+    } while (cursor);
+    return ids;
+  }
+  // 故意并发：多工作进程同时翻页
+  return Promise.all(Array.from({ length: workerCount }, (_, w) => drainOne(w)));
+}
 
 test('健康检查可用', async () => {
   const r = await api('/health');
@@ -247,4 +279,272 @@ test('游标在服务重启后仍可继续（同密钥 + 持久化 DB）', async
   assert.deepEqual(page.items.map((i) => i.sampleId), ['r4']);
   assert.equal(page.nextCursor, null);
   assert.equal(page.done, true);
+});
+
+/* ============================ 并行导出 ============================ */
+
+test('POST exports：参数校验与返回结构', async () => {
+  // workerCount 越界/类型错
+  for (const body of ['1', '9', '0', 'null', '"4"', '2.5']) {
+    const r = await createExport('exp-val', { workerCount: JSON.parse(body) });
+    assert.equal(r.status, 400, `body=${body}`);
+  }
+  // 坏 JSON
+  let r = await api('/api/streams/exp-val/exports', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{oops',
+  });
+  assert.equal(r.status, 400);
+
+  // 时间范围非法
+  r = await createExport('exp-val', {
+    workerCount: 2, from: '2026-02-01T00:00:00Z', to: '2026-01-01T00:00:00Z',
+  });
+  assert.equal(r.status, 400);
+
+  // 合法：返回不透明 token、快照序号与实际 worker 数
+  r = await createExport('exp-val', {
+    from: '2026-01-01T00:00:00Z', to: '2026-12-31T23:59:59Z', workerCount: 4,
+  });
+  assert.equal(r.status, 201);
+  const j = await r.json();
+  assert.equal(typeof j.exportToken, 'string');
+  assert.ok(j.exportToken.includes('.'));
+  assert.equal(j.workerCount, 4);
+  assert.equal(typeof j.snapshotSeq, 'number');
+});
+
+test('并行导出：多 worker 并发翻页不重不漏，新增数据不进入，空分片结束', async () => {
+  const stream = 'exp-parallel';
+  const samples = Array.from({ length: 50 }, (_, i) => ({
+    sampleId: `e${String(i).padStart(2, '0')}`,
+    ts: `2026-03-0${(i % 9) + 1}T00:00:${String(i % 13).padStart(2, '0')}Z`,
+    value: i,
+  }));
+  for (let i = 0; i < samples.length; i += 40) {
+    const rr = await postSamples(stream, samples.slice(i, i + 40));
+    assert.equal(rr.status, 200);
+  }
+
+  const cr = await createExport(stream, { workerCount: 6 });
+  assert.equal(cr.status, 201);
+  const created = await cr.json();
+  const { exportToken: token, snapshotSeq } = created;
+  assert.equal(created.workerCount, 6);
+
+  // 导出创建后写入新数据（含更早时刻与更晚时刻），不得进入本次导出
+  const nr = await postSamples(stream, [
+    { sampleId: 'future', ts: '2030-01-01T00:00:00Z', value: 1 },
+    { sampleId: 'before', ts: '2020-01-01T00:00:00Z', value: 2 },
+  ]);
+  assert.equal(nr.status, 200);
+
+  const shards = await drainExport(stream, token, 6, { pageSize: 3 });
+  const flat = shards.flat();
+  assert.equal(flat.length, 50, '合并总数 = 创建时范围内全部观测');
+  assert.equal(new Set(flat).size, 50, '无重叠/重复');
+  assert.ok(!flat.includes('future') && !flat.includes('before'),
+    '创建后新增数据不进入');
+  assert.ok(shards.some((s) => s.length > 0), '至少一个分片非空');
+
+  // 每页回应回带分片元数据
+  const probe = await api(
+    `/api/streams/${stream}/samples?exportToken=${encodeURIComponent(token)}` +
+    `&workerIndex=0&pageSize=2`);
+  const pj = await probe.json();
+  assert.equal(pj.workerCount, 6);
+  assert.equal(pj.workerIndex, 0);
+  assert.equal(pj.snapshotSeq, snapshotSeq);
+
+  // 空分片（空流导出）首页即 done
+  const er = await createExport('exp-empty', { workerCount: 2 });
+  const ej = await er.json();
+  for (const w of [0, 1]) {
+    const rr = await api(
+      `/api/streams/exp-empty/samples?exportToken=${encodeURIComponent(ej.exportToken)}` +
+      `&workerIndex=${w}`);
+    const pg = await rr.json();
+    assert.equal(rr.status, 200);
+    assert.equal(pg.done, true);
+    assert.equal(pg.nextCursor, null);
+    assert.equal(pg.items.length, 0);
+  }
+});
+
+test('并行导出：各 workerCount 下合并结果都等于普通全量快照', async () => {
+  const stream = 'exp-equivalence';
+  const samples = Array.from({ length: 40 }, (_, i) => ({
+    sampleId: `q${String(i).padStart(2, '0')}`,
+    ts: `2026-08-01T00:${String(i % 11).padStart(2, '0')}:00Z`,
+    value: i,
+  }));
+  await postSamples(stream, samples.slice(0, 20));
+  await postSamples(stream, samples.slice(20));
+
+  // 普通快照作为基准
+  const full = await api(`/api/streams/${stream}/samples?pageSize=1000`);
+  const fullPage = await full.json();
+  const want = fullPage.items.map((i) => i.sampleId).sort();
+
+  for (const w of [2, 3, 4, 5, 7, 8]) {
+    const cr = await createExport(stream, { workerCount: w });
+    const { exportToken: token } = await cr.json();
+    const shards = await drainExport(stream, token, w, { pageSize: 5 });
+    const got = shards.flat().sort();
+    assert.equal(got.length, 40, `w=${w} 总数`);
+    assert.equal(new Set(shards.flat()).size, 40, `w=${w} 无重复`);
+    assert.deepEqual(got, want, `w=${w} 合并后等于全量快照`);
+  }
+});
+
+test('并行导出：时间范围固定在令牌上', async () => {
+  const stream = 'exp-range';
+  await postSamples(stream, [
+    { sampleId: 'a', ts: '2026-01-01T00:00:00Z', value: 1 },
+    { sampleId: 'b', ts: '2026-01-02T00:00:00Z', value: 2 },
+    { sampleId: 'c', ts: '2026-01-03T00:00:00Z', value: 3 },
+  ]);
+  const cr = await createExport(stream, {
+    from: '2026-01-01T00:00:00Z', to: '2026-01-02T00:00:00Z', workerCount: 2,
+  });
+  const { exportToken: token } = await cr.json();
+  const shards = await drainExport(stream, token, 2, { pageSize: 1 });
+  const got = shards.flat().sort();
+  assert.deepEqual(got, ['a', 'b'], '仅范围内观测');
+});
+
+test('并行导出：令牌/游标四类误用返回可区分错误且不泄露数据', async () => {
+  const stream = 'exp-errors';
+  await postSamples(stream, Array.from({ length: 8 }, (_, i) => ({
+    sampleId: `x${i}`, ts: `2026-09-0${i + 1}T00:00:00Z`, value: i,
+  })));
+  const cr = await createExport(stream, { workerCount: 3 });
+  const created = await cr.json();
+  const T = encodeURIComponent(created.exportToken);
+
+  async function expectErr(name, path, code, status = 400) {
+    const rr = await api(path);
+    const jj = await rr.json();
+    assert.equal(rr.status, status, `${name}: status`);
+    assert.equal(jj.error.code, code, `${name}: code (got ${jj.error.code})`);
+    assert.equal(jj.items, undefined, `${name}: 不返回数据`);
+  }
+
+  // 1) 令牌篡改
+  const bad = created.exportToken;
+  const mid = Math.floor(bad.length / 2);
+  const tampered = bad.slice(0, mid) + (bad[mid] === 'A' ? 'B' : 'A') + bad.slice(mid + 1);
+  await expectErr('篡改令牌',
+    `/api/streams/${stream}/samples?exportToken=${encodeURIComponent(tampered)}&workerIndex=0`,
+    'export_token_signature_invalid');
+
+  // 2) 跨流使用
+  await expectErr('跨流使用',
+    `/api/streams/exp-other/samples?exportToken=${T}&workerIndex=0`,
+    'export_stream_mismatch');
+
+  // 3) workerIndex 越界 / 缺省 / 非整数
+  await expectErr('workerIndex 越界',
+    `/api/streams/${stream}/samples?exportToken=${T}&workerIndex=3`,
+    'worker_index_out_of_range');
+  await expectErr('workerIndex 缺省',
+    `/api/streams/${stream}/samples?exportToken=${T}`,
+    'worker_index_required');
+  await expectErr('workerIndex 非数字',
+    `/api/streams/${stream}/samples?exportToken=${T}&workerIndex=x`,
+    'invalid_query');
+
+  // 4) 分片游标用于另一分片
+  const p0 = await api(
+    `/api/streams/${stream}/samples?exportToken=${T}&workerIndex=0&pageSize=1`);
+  const p0j = await p0.json();
+  assert.ok(p0j.nextCursor, '前置：worker0 有续页游标');
+  await expectErr('游标用于另一分片',
+    `/api/streams/${stream}/samples?exportToken=${T}&workerIndex=1&pageSize=1` +
+    `&cursor=${encodeURIComponent(p0j.nextCursor)}`,
+    'shard_cursor_mismatch');
+
+  // 5) 分片游标篡改
+  const sc = p0j.nextCursor;
+  const smid = Math.floor(sc.length / 2);
+  const sTampered = sc.slice(0, smid) + (sc[smid] === 'A' ? 'B' : 'A') + sc.slice(smid + 1);
+  await expectErr('分片游标篡改',
+    `/api/streams/${stream}/samples?exportToken=${T}&workerIndex=0` +
+    `&cursor=${encodeURIComponent(sTampered)}`,
+    'shard_cursor_signature_invalid');
+
+  // 6) 分片游标跨流（令牌先被跨流拒绝，且不返回数据）
+  await expectErr('分片游标跨流',
+    `/api/streams/exp-other/samples?exportToken=${T}&workerIndex=0` +
+    `&cursor=${encodeURIComponent(sc)}`,
+    'export_stream_mismatch');
+
+  // 7) 分片游标不能脱离令牌走普通分页
+  await expectErr('分片游标走普通通道',
+    `/api/streams/${stream}/samples?cursor=${encodeURIComponent(sc)}`,
+    'export_token_required');
+
+  // 8) 普通 v1 游标不能塞进导出 cursor
+  const vp = await api(`/api/streams/${stream}/samples?pageSize=1`);
+  const vCursor = (await vp.json()).nextCursor;
+  await expectErr('普通游标用于导出',
+    `/api/streams/${stream}/samples?exportToken=${T}&workerIndex=0` +
+    `&cursor=${encodeURIComponent(vCursor)}`,
+    'invalid_shard_cursor');
+});
+
+test('并行导出：合法令牌与游标在服务重启后仍能完成原快照', async () => {
+  const stream = 'exp-restart';
+  await postSamples(stream, Array.from({ length: 21 }, (_, i) => ({
+    sampleId: `z${String(i).padStart(2, '0')}`,
+    ts: `2026-04-01T00:${String(i % 7).padStart(2, '0')}:00Z`,
+    value: i,
+  })));
+
+  // 创建导出，取走每个分片第一页游标（记录是否已结束）
+  const cr = await createExport(stream, { workerCount: 4 });
+  const created = await cr.json();
+  const token = created.exportToken;
+  const held = [];
+  const beforeRestart = [];
+  for (let w = 0; w < 4; w++) {
+    const rr = await api(
+      `/api/streams/${stream}/samples?exportToken=${encodeURIComponent(token)}` +
+      `&workerIndex=${w}&pageSize=2`);
+    const pg = await rr.json();
+    held[w] = { cursor: pg.nextCursor, done: pg.done };
+    beforeRestart.push(...pg.items.map((i) => i.sampleId));
+  }
+
+  // 重启期间继续写入新数据
+  await postSamples(stream, [
+    { sampleId: 'after-restart', ts: '2019-01-01T00:00:00Z', value: 0 },
+  ]);
+
+  // 重启
+  await app.close();
+  app = createApp({ dbPath: join(dir, 'int.db'), cursorSecret: SECRET });
+  baseUrl = await listen(app);
+
+  // 用原令牌 + 各分片持有的游标继续未完成的分片，直到结束
+  const afterItems = [];
+  for (let w = 0; w < 4; w++) {
+    if (held[w].done) continue; // 重启前已结束，不重复拉取
+    let cursor = held[w].cursor;
+    for (;;) {
+      const u = `/api/streams/${stream}/samples?exportToken=${encodeURIComponent(token)}` +
+        `&workerIndex=${w}&pageSize=2` +
+        (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+      const rr = await fetch(baseUrl + u);
+      assert.equal(rr.status, 200, `重启后 worker ${w} 继续`);
+      const pg = await rr.json();
+      assert.equal(pg.snapshotSeq, created.snapshotSeq, '快照序号重启后不变');
+      afterItems.push(...pg.items.map((i) => i.sampleId));
+      cursor = pg.nextCursor;
+      if (!cursor) break;
+    }
+  }
+  const merged = [...beforeRestart, ...afterItems];
+  assert.equal(merged.length, 21, '重启后合并仍恰好覆盖原快照 21 条');
+  assert.equal(new Set(merged).size, 21, '无重复');
+  assert.ok(!merged.includes('after-restart'), '重启期间新增数据不进入');
 });

@@ -174,6 +174,8 @@ async function runSmoke(baseUrl, { restartFlow = null } = {}) {
     page.items.slice(0, 2).map((i) => i.sampleId).join(',') === 'old1,old2',
     JSON.stringify(page.items.map((i) => i.sampleId)));
 
+  await runExportSmoke({ baseUrlRef: () => baseUrl, setBaseUrl: (u) => { baseUrl = u; }, get, post, S, runId, restartFlow });
+
   // 13) 重启后游标继续（仅本地模式可以真的重启进程）
   if (restartFlow) {
     const persistStream = S('persist');
@@ -209,8 +211,229 @@ async function runSmoke(baseUrl, { restartFlow = null } = {}) {
   }
 }
 
-function startLocalServer(dbPath) {
-  const child = spawn(process.execPath, ['src/server.js'], {
+/**
+ * 并行导出冒烟：
+ *  - 创建导出（可选时间范围 + 2..8 worker）返回不透明令牌/快照序号/实际 worker 数；
+ *  - 多个 worker 并发翻页，分片不重叠、合并恰好覆盖快照范围，期间新增数据不进入；
+ *  - 空分片首页即结束；
+ *  - 令牌篡改 / 跨流 / workerIndex 越界 / 游标用于另一分片 -> 可区分错误码；
+ *  - 未携带 exportToken 的旧分页行为不受影响（本文件前述步骤已覆盖）。
+ * 本地模式额外验证：合法令牌与游标在服务重启后仍可完成原快照。
+ */
+async function runExportSmoke(ctx) {
+  const { get, post, S, restartFlow } = ctx;
+  const baseUrl = () => ctx.baseUrlRef();
+  const jget = (p) => fetch(baseUrl() + p);
+
+  logs.push('# 并行导出冒烟');
+  const stream = S('export');
+  const N = 37;
+  // 时刻大量重复（同刻多条），验证按 sampleId 打散
+  const samples = Array.from({ length: N }, (_, i) => ({
+    sampleId: `m${String(i).padStart(2, '0')}`,
+    ts: `2026-10-01T00:00:${String(i % 7).padStart(2, '0')}Z`,
+    value: i,
+  }));
+  let r = await post(stream, samples.slice(0, 30));
+  check('导出前写入首批', r.status === 200, `status=${r.status}`);
+
+  // 创建导出：时间范围 + workerCount=5
+  r = await fetch(`${baseUrl()}/api/streams/${stream}/exports`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      from: '2026-01-01T00:00:00Z',
+      to: '2027-01-01T00:00:00Z',
+      workerCount: 5,
+    }),
+  });
+  check('POST exports -> 201', r.status === 201, `status=${r.status}`);
+  const created = await r.json();
+  check('返回不透明 exportToken',
+    typeof created.exportToken === 'string' && created.exportToken.includes('.'));
+  check('返回实际 workerCount=5', created.workerCount === 5);
+  check('返回 snapshotSeq', Number.isInteger(created.snapshotSeq));
+  const token = created.exportToken;
+
+  // 创建后再写 7 条（含范围外与范围内），均不得进入该快照
+  r = await post(stream, [
+    ...samples.slice(30),
+    { sampleId: 'late-arrival', ts: '2026-10-02T00:00:00Z', value: 99 },
+  ]);
+  check('导出创建后写入成功', r.status === 200, `status=${r.status}`);
+
+  // workerCount 非法
+  for (const bad of [1, 9]) {
+    r = await fetch(`${baseUrl()}/api/streams/${stream}/exports`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workerCount: bad }),
+    });
+    check(`workerCount=${bad} -> 400`, r.status === 400, `status=${r.status}`);
+  }
+
+  // 五个 worker 并发翻页
+  async function drainWorker(w) {
+    const ids = [];
+    let cursor = null;
+    let guard = 0;
+    do {
+      const u = `/api/streams/${stream}/samples?exportToken=${encodeURIComponent(token)}` +
+        `&workerIndex=${w}&pageSize=3` +
+        (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+      const rr = await jget(u);
+      const pg = await rr.json();
+      if (!rr.ok) throw new Error(`worker ${w} ${rr.status} ${pg.error?.code}`);
+      ids.push(...pg.items.map((i) => i.sampleId));
+      cursor = pg.nextCursor;
+      if (++guard > 100) throw new Error('分页守卫');
+    } while (cursor);
+    return { ids };
+  }
+
+  const shards = await Promise.all([0, 1, 2, 3, 4].map((w) => drainWorker(w)));
+  const counts = shards.map((s) => s.ids.length);
+  logs.push(`    各分片条数: ${counts.join(', ')}`);
+  const merged = shards.flatMap((s) => s.ids);
+  check('合并恰好覆盖快照内 30 条',
+    merged.length === 30, `got ${merged.length}`);
+  check('分片互不重叠（无重复）', new Set(merged).size === 30);
+  check('合并等于创建时范围内全部观测',
+    JSON.stringify([...merged].sort()) ===
+      JSON.stringify(samples.slice(0, 30).map((s) => s.sampleId).sort()),
+    JSON.stringify([...merged].sort()));
+  check('创建后新增数据未进入', !merged.includes('late-arrival'));
+
+  // 空分片：空流导出，每个 worker 首页即 done
+  r = await fetch(`${baseUrl()}/api/streams/${S('export-empty')}/exports`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ workerCount: 3 }),
+  });
+  const emptyExport = await r.json();
+  let allEmpty = true;
+  for (let w = 0; w < 3; w++) {
+    const rr = await jget(
+      `/api/streams/${S('export-empty')}/samples` +
+      `?exportToken=${encodeURIComponent(emptyExport.exportToken)}&workerIndex=${w}`);
+    const pg = await rr.json();
+    if (!(rr.ok && pg.done === true && pg.items.length === 0)) allEmpty = false;
+  }
+  check('空分片首页直接 done', allEmpty);
+
+  // ---- 错误路径（错误码可区分且不返回数据）----
+  async function errCode(p) {
+    const rr = await jget(p);
+    const jj = await rr.json();
+    check('错误路径返回 400 且不携带数据',
+      rr.status === 400 && jj.items === undefined, `status=${rr.status}`);
+    return jj.error?.code;
+  }
+  const T = encodeURIComponent(token);
+  const mid = Math.floor(token.length / 2);
+  const tampered = token.slice(0, mid) + (token[mid] === 'A' ? 'B' : 'A') + token.slice(mid + 1);
+  check('令牌篡改 -> export_token_signature_invalid',
+    (await errCode(`/api/streams/${stream}/samples?exportToken=${encodeURIComponent(tampered)}&workerIndex=0`))
+      === 'export_token_signature_invalid');
+  check('令牌跨流 -> export_stream_mismatch',
+    (await errCode(`/api/streams/${S('other')}/samples?exportToken=${T}&workerIndex=0`))
+      === 'export_stream_mismatch');
+  check('workerIndex 越界 -> worker_index_out_of_range',
+    (await errCode(`/api/streams/${stream}/samples?exportToken=${T}&workerIndex=5`))
+      === 'worker_index_out_of_range');
+  check('workerIndex 缺省 -> worker_index_required',
+    (await errCode(`/api/streams/${stream}/samples?exportToken=${T}`))
+      === 'worker_index_required');
+
+  // 游标用于另一分片
+  let pg = await (await jget(
+    `/api/streams/${stream}/samples?exportToken=${T}&workerIndex=0&pageSize=1`)).json();
+  const c0 = pg.nextCursor;
+  check('取到 worker0 续页游标', typeof c0 === 'string');
+  check('游标用于另一分片 -> shard_cursor_mismatch',
+    (await errCode(`/api/streams/${stream}/samples?exportToken=${T}&workerIndex=1&pageSize=1` +
+      `&cursor=${encodeURIComponent(c0)}`)) === 'shard_cursor_mismatch');
+  const cmid = Math.floor(c0.length / 2);
+  const cBad = c0.slice(0, cmid) + (c0[cmid] === 'A' ? 'B' : 'A') + c0.slice(cmid + 1);
+  check('分片游标篡改 -> shard_cursor_signature_invalid',
+    (await errCode(`/api/streams/${stream}/samples?exportToken=${T}&workerIndex=0` +
+      `&cursor=${encodeURIComponent(cBad)}`)) === 'shard_cursor_signature_invalid');
+  check('分片游标不能走普通分页 -> export_token_required',
+    (await errCode(`/api/streams/${stream}/samples?cursor=${encodeURIComponent(c0)}`))
+      === 'export_token_required');
+
+  // ---- 重启后继续原快照（仅本地模式）----
+  if (restartFlow) {
+    const persistStream = S('export-persist');
+    const PN = 13;
+    await post(persistStream, Array.from({ length: PN }, (_, i) => ({
+      sampleId: `t${String(i).padStart(2, '0')}`,
+      ts: `2026-05-01T00:00:${String(i % 5).padStart(2, '0')}Z`,
+      value: i,
+    })));
+    let rr = await fetch(`${baseUrl()}/api/streams/${persistStream}/exports`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workerCount: 3 }),
+    });
+    const pe = await rr.json();
+    const pt = pe.exportToken;
+
+    // 每分片先取首页并持有游标
+    const held = [];
+    const before = [];
+    for (let w = 0; w < 3; w++) {
+      const hh = await drainWorkerOn(persistStream, pt, w, { onlyFirst: true, fetch: jget });
+      held.push(hh);
+      before.push(...hh.firstIds);
+    }
+
+    // 重启，并在重启后写入新数据
+    const newBase = await restartFlow();
+    ctx.setBaseUrl(newBase);
+    await post(persistStream, [
+      { sampleId: 'post-restart', ts: '2018-01-01T00:00:00Z', value: 0 },
+    ]);
+
+    // 用原令牌与游标完成剩余分片
+    const afterIds = [];
+    for (let w = 0; w < 3; w++) {
+      if (held[w].done) continue;
+      let cursor = held[w].cursor;
+      let guard = 0;
+      do {
+        const u = `/api/streams/${persistStream}/samples?exportToken=${encodeURIComponent(pt)}` +
+          `&workerIndex=${w}&pageSize=3` +
+          (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+        const x = await fetch(newBase + u);
+        const j = await x.json();
+        check('重启后分片请求 200', x.ok, `w=${w} status=${x.status}`);
+        check('重启后 snapshotSeq 不变', j.snapshotSeq === pe.snapshotSeq);
+        afterIds.push(...j.items.map((i) => i.sampleId));
+        cursor = j.nextCursor;
+        if (++guard > 50) throw new Error('守卫');
+      } while (cursor);
+    }
+    const allIds = [...before, ...afterIds];
+    check('重启后各分片合并仍恰好覆盖原快照',
+      allIds.length === PN && new Set(allIds).size === PN,
+      `got ${allIds.length}`);
+    check('重启后新增数据不进入', !allIds.includes('post-restart'));
+  }
+}
+
+/** 在指定流上取某 worker 分片的第一页（重启流程用）。 */
+async function drainWorkerOn(stream, token, w, { onlyFirst, fetch }) {
+  const u = `/api/streams/${stream}/samples?exportToken=${encodeURIComponent(token)}` +
+    `&workerIndex=${w}&pageSize=3`;
+  const rr = await fetch(u);
+  const pg = await rr.json();
+  if (!rr.ok) throw new Error(`w=${w} ${rr.status}`);
+  return {
+    firstIds: pg.items.map((i) => i.sampleId),
+    cursor: pg.nextCursor,
+    done: pg.done,
+  };
+}
+
+function startLocalServer(dbPath) {  const child = spawn(process.execPath, ['src/server.js'], {
     env: {
       ...process.env,
       PORT: '0',

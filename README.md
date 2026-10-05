@@ -22,8 +22,8 @@ docker compose logs verify     # 查看 verify 明细
 本地开发（无需 Docker）：
 
 ```bash
-npm test                 # 单元 + HTTP 集成测试（19 项）
-npm run smoke            # 本地拉起服务冒烟，含进程重启后续游标（27 项检查）
+npm test                 # 单元 + HTTP 集成测试（41 项）
+npm run smoke            # 本地拉起服务冒烟，含进程重启后续游标/导出令牌
 PORT=8080 npm start
 ```
 
@@ -78,6 +78,78 @@ PORT=8080 npm start
 - 需要新数据时重新发起一次无游标请求，即固定新的快照上界。
 - 分页采用 keyset（`(ts, sampleId)` 元组比较）而非 OFFSET，插入不会导致漂移。
 
+### 并行导出：`POST /api/streams/{streamId}/exports`
+
+大型快照可由 **2–8 个工作进程并行翻页**导出。创建导出时锁定一份稳定快照，
+各分片互不重叠，合并后恰好覆盖该快照中时间范围内的全部观测；导出期间
+（含服务重启）到达的新数据一律不进入本次导出。
+
+请求体（均可缺省，仅 `workerCount` 必填）：
+
+```json
+{
+  "from": "2026-01-01T00:00:00Z",
+  "to": "2026-12-31T23:59:59Z",
+  "workerCount": 4
+}
+```
+
+成功返回 `201`：
+
+```json
+{
+  "exportToken": "eyJ2IjoyLCJrIjoiZS….<HMAC>",
+  "snapshotSeq": 128,
+  "workerCount": 4
+}
+```
+
+- `exportToken` 为不透明签名令牌，锁定流、时间范围、快照序号与 worker 数；
+  `workerCount` 允许 2..8，服务返回实际采用的工作进程数。
+- 随后各工作进程在**现有 GET samples 请求**上携带以下查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `exportToken` | 创建导出返回的令牌（必填） |
+| `workerIndex` | 零基分片编号，`0..workerCount-1`（必填） |
+| `pageSize` | 每页条数，1–1000，默认 100 |
+| `cursor` | 该分片上一页返回的续页游标（首页不传） |
+
+```json
+{
+  "items": [ /* 与普通分页相同的观测项 */ ],
+  "pageSize": 100,
+  "snapshotSeq": 128,
+  "workerIndex": 0,
+  "workerCount": 4,
+  "nextCursor": "….<HMAC>",
+  "done": false
+}
+```
+
+**分片语义**：每条观测按 `(ts, sampleId)` 哈希落入固定 8 个桶，
+worker `k` 负责所有满足 `bucket % workerCount == k` 的桶。因此：
+
+- 各分片**互不相交**：每个桶只属于一个 worker；
+- 合并**恰好覆盖**创建导出时范围内的全部观测，无漏项、无重复；
+- **空分片**首页即返回 `done: true`、`items: []`，工作进程直接结束；
+- 合法令牌及其游标在**服务重启后**仍可让各 worker 完成原快照
+  （配合固定的 `CURSOR_SECRET` 与持久化数据卷）。
+- 未携带 `exportToken` 的请求完全保持原批量接入与快照分页行为，向后兼容。
+
+**导出误用的可区分错误（均为 400，且不返回任何数据）**：
+
+| 情形 | error.code |
+| --- | --- |
+| 令牌篡改/伪造/格式损坏 | `export_token_signature_invalid` / `invalid_export_token` |
+| 令牌跨流使用 | `export_stream_mismatch` |
+| `workerIndex` 越界（≥ workerCount） | `worker_index_out_of_range` |
+| 携带令牌但缺少 `workerIndex` | `worker_index_required` |
+| 把某分片的游标用于另一个分片 | `shard_cursor_mismatch` |
+| 分片游标篡改 | `shard_cursor_signature_invalid` / `invalid_shard_cursor` |
+| 分片游标跨流 | `shard_stream_mismatch` |
+| 分片游标脱离令牌走普通分页 | `export_token_required` |
+
 ### 游标安全与生命周期
 
 - 游标为 `base64url(JSON).HMAC-SHA256`，不透明、不可伪造；密钥由环境变量
@@ -112,6 +184,9 @@ PORT=8080 npm start
 2. 在**清洁启动**的 API 上运行代码测试；
 3. 插入初始数据、分页取首页，**在分页中途追加更早时刻的观测**，继续翻页并断言
    不漏项 / 不重复 / 页序不漂移、快照序号不变；
-4. 覆盖批内重复、编号冲突整批拒绝、游标篡改、跨流复用、改变时间范围等错误路径。
+4. **并行导出冒烟**：多 worker 并发翻页断言分片不重叠且合并恰好覆盖快照、
+   期间新增数据不进入、空分片立即结束，并覆盖令牌篡改 / 跨流 /
+   workerIndex 越界 / 游标用于另一分片等错误路径；
+5. 覆盖批内重复、编号冲突整批拒绝、游标篡改、跨流复用、改变时间范围等错误路径。
 
 全部通过退出码为 `0`，任一失败非零。

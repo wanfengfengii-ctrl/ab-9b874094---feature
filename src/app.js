@@ -5,14 +5,21 @@ import {
   issueCursor,
   parseCursor,
   bindCursor,
+  issueExportToken,
+  parseExportToken,
+  bindExportToken,
+  issueShardCursor,
+  parseShardCursor,
+  bindShardCursor,
   CursorError,
 } from './cursor.js';
 import {
   validateBatch,
   validateQuery,
+  validateExport,
   ValidationError,
-  TIME_BOUNDS,
 } from './validation.js';
+import { bucketsForWorker } from './shard.js';
 
 const STREAM_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
 
@@ -56,8 +63,13 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
 
   /**
    * GET /api/streams/:streamId/samples
-   * 首次请求（无 cursor）：固定当前接收序号为快照上界。
-   * 后续请求（带 cursor）：沿用发起时的快照序号与时间范围，游标重启后仍可用。
+   *
+   * 两种模式：
+   *  - 无 exportToken（兼容）：首次请求固定当前接收序号为快照上界；
+   *    后续请求（带 v1 cursor）沿用发起时的快照与时间范围，游标重启后仍可用。
+   *  - 带 exportToken（并行导出）：令牌固定快照、范围与 worker 数；
+   *    workerIndex 零基；cursor 为该分片自己的续页游标，分片间不重叠、
+   *    合并恰好覆盖创建导出时范围内的全部观测。
    */
   function handleList(req, res, streamId, url) {
     let q;
@@ -69,9 +81,13 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
       }
       throw err;
     }
+    return q.exportToken
+      ? handleShardList(res, streamId, q, url)
+      : handleSnapshotList(res, streamId, q, url);
+  }
 
+  function handleSnapshotList(res, streamId, q, url) {
     let snapshotSeq, fromTs, toTs, pageSize, after;
-    let sessionStarted = false;
 
     if (q.cursor) {
       let payload;
@@ -103,7 +119,6 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
       toTs = q.toTs;
       pageSize = q.pageSize;
       after = null;
-      sessionStarted = true;
     }
 
     const limit = pageSize + 1; // 多取一条以判断是否还有下一页
@@ -142,6 +157,113 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
     });
   }
 
+  /** POST /api/streams/:streamId/exports —— 创建一次并行导出（固定稳定快照）。 */
+  async function handleCreateExport(req, res, streamId) {
+    const body = await readJson(req);
+    const { fromTs, toTs, workerCount } = validateExport(body);
+    const snapshotSeq = store.currentSeq();
+    // 随机导出 id 仅用于把“游标用于另一次导出”与其他误用区分；不可猜测，不回显载荷
+    const id = randomBytes(16).toString('base64url');
+    const exportToken = issueExportToken(cursorSecret, {
+      id, streamId, snapshotSeq, workerCount, fromTs, toTs,
+    });
+    return send(res, 201, {
+      exportToken,
+      snapshotSeq,
+      workerCount,
+    });
+  }
+
+  /** GET samples（并行导出模式）：读取某 worker 负责的分片页。 */
+  function handleShardList(res, streamId, q, url) {
+    let token;
+    try {
+      token = parseExportToken(cursorSecret, q.exportToken);
+      bindExportToken(token, { streamId });
+    } catch (err) {
+      if (err instanceof CursorError) {
+        return sendError(res, err.statusCode, err.code, err.message);
+      }
+      throw err;
+    }
+
+    // workerIndex 为必填（零基），先做格式/范围校验
+    if (q.workerIndex === null) {
+      return sendError(res, 400, 'worker_index_required',
+        '携带 exportToken 时必须提供零基 workerIndex');
+    }
+    if (q.workerIndex >= token.workerCount) {
+      return sendError(res, 400, 'worker_index_out_of_range',
+        `workerIndex 越界：该导出 workerCount=${token.workerCount}，` +
+        `允许 0..${token.workerCount - 1}`);
+    }
+    const workerIndex = q.workerIndex;
+
+    // 时间范围与快照完全由令牌固定，忽略查询参数中可能携带的 from/to，
+    // 保证任何工作进程都只能读到创建导出时锁定的那一份范围。
+    let snapshotSeq = token.snapshotSeq;
+    let fromTs = token.fromTs;
+    let toTs = token.toTs;
+    let pageSize = q.pageSize;
+    let after = null;
+
+    if (q.cursor) {
+      let cur;
+      try {
+        cur = parseShardCursor(cursorSecret, q.cursor);
+        // 页大小与普通分页一致：未显式携带 pageSize 则沿用游标中的值
+        const reqPageSize = url.searchParams.has('pageSize') ? q.pageSize : null;
+        ({ snapshotSeq, fromTs, toTs, pageSize, after } =
+          bindShardCursor(cur, { token, streamId, workerIndex, pageSize: reqPageSize }));
+      } catch (err) {
+        if (err instanceof CursorError) {
+          return sendError(res, err.statusCode, err.code, err.message);
+        }
+        throw err;
+      }
+    }
+
+    const buckets = bucketsForWorker(token.workerCount, workerIndex);
+    const limit = pageSize + 1;
+    const rows = store.readShardPage(
+      streamId, snapshotSeq, { fromTs, toTs }, buckets, after, limit
+    );
+    const hasMore = rows.length > pageSize;
+    const page = hasMore ? rows.slice(0, pageSize) : rows;
+
+    const items = page.map((r) => ({
+      sampleId: r.sampleId,
+      ts: r.ts,
+      value: r.value,
+    }));
+
+    let nextCursor = null;
+    if (hasMore && page.length > 0) {
+      const last = page[page.length - 1];
+      nextCursor = issueShardCursor(cursorSecret, {
+        id: token.id,
+        streamId,
+        snapshotSeq,
+        workerCount: token.workerCount,
+        workerIndex,
+        fromTs,
+        toTs,
+        pageSize,
+        after: { bucket: last.bucket, ts: last.ts, sampleId: last.sampleId },
+      });
+    }
+
+    return send(res, 200, {
+      items,
+      pageSize,
+      snapshotSeq,
+      workerIndex,
+      workerCount: token.workerCount,
+      nextCursor,
+      done: nextCursor === null,
+    });
+  }
+
   async function handlePost(req, res, streamId) {
     const body = await readJson(req);
     const { items } = validateBatch(body);
@@ -172,7 +294,9 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
         });
       }
 
-      const m = url.pathname.match(/^\/api\/streams\/([^/]+)\/samples\/?$/);
+      const samplesMatch = url.pathname.match(/^\/api\/streams\/([^/]+)\/samples\/?$/);
+      const exportMatch = url.pathname.match(/^\/api\/streams\/([^/]+)\/exports\/?$/);
+      const m = samplesMatch ?? exportMatch;
       if (!m) {
         return sendError(res, 404, 'not_found', `路径不存在: ${url.pathname}`);
       }
@@ -186,9 +310,15 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
         return sendError(res, 400, 'invalid_stream_id', 'streamId 非法');
       }
 
+      if (exportMatch) {
+        if (req.method !== 'POST') {
+          return sendError(res, 405, 'method_not_allowed', '仅支持 POST 创建导出');
+        }
+        return await handleCreateExport(req, res, streamId);
+      }
       if (req.method === 'POST') return await handlePost(req, res, streamId);
       if (req.method === 'GET') return handleList(req, res, streamId, url);
-      return sendError(res, 405, 'method_not_allowed', '仅支持 GET / POST', );
+      return sendError(res, 405, 'method_not_allowed', '仅支持 GET / POST');
     } catch (err) {
       if (err instanceof ValidationError) {
         return sendError(res, 400, 'invalid_request', err.message, err.details);

@@ -90,6 +90,10 @@ export function validateBatch(body) {
 
 /**
  * 校验查询参数。from/to 可缺省（缺省用 MIN/MAX）；cursor 存在时时间范围由游标会话决定。
+ *
+ * 普通快照分页：from/to/pageSize/cursor。
+ * 并行导出分片：exportToken（必填）、workerIndex（零基，必填）、pageSize、cursor
+ * （游标为该分片的续页游标）。未携带 exportToken 时一切行为与旧版兼容。
  */
 export function validateQuery(searchParams) {
   const out = { rawFrom: null, rawTo: null, fromTs: MIN_TS, toTs: MAX_TS };
@@ -121,7 +125,50 @@ export function validateQuery(searchParams) {
   }
   out.pageSize = pageSize;
   out.cursor = searchParams.get('cursor');
+
+  out.exportToken = searchParams.get('exportToken');
+  const wi = searchParams.get('workerIndex');
+  if (wi !== null) {
+    if (!/^\d+$/.test(wi)) {
+      throw new ValidationError('workerIndex 必须为零基非负整数');
+    }
+    out.workerIndex = Number(wi);
+  } else {
+    out.workerIndex = null;
+  }
   return out;
+}
+
+/**
+ * 校验导出创建请求体（POST .../exports）。
+ * @returns {{fromTs:string, toTs:string, workerCount:number}}
+ */
+export function validateExport(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ValidationError('请求体必须为对象');
+  }
+
+  let fromTs = MIN_TS;
+  let toTs = MAX_TS;
+  if (body.from !== undefined && body.from !== null) {
+    fromTs = parseRfc3339(body.from).canonical;
+  }
+  if (body.to !== undefined && body.to !== null) {
+    toTs = parseRfc3339(body.to).canonical;
+  }
+  if (fromTs > toTs) {
+    throw new ValidationError('时间范围非法：from 晚于 to');
+  }
+
+  // workerCount 必填，允许 2..8
+  const wc = body.workerCount;
+  if (typeof wc !== 'number' || !Number.isInteger(wc) || wc < 2 || wc > 8) {
+    throw new ValidationError('workerCount 必须为 2..8 的整数', {
+      received: wc,
+    });
+  }
+
+  return { fromTs, toTs, workerCount: wc };
 }
 
 export const TIME_BOUNDS = { MIN_TS, MAX_TS };
